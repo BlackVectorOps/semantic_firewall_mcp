@@ -173,7 +173,16 @@ func buildProvider(name, apiKey, apiBase string) (provider.Provider, error) {
 		}
 		return provider.NewGemini(apiKey), nil
 	case "openai-compatible", "compat":
-		return nil, fmt.Errorf("openai-compatible provider lands in a subsequent commit")
+		if apiKey == "" {
+			apiKey = os.Getenv("OPENAI_COMPAT_API_KEY")
+		}
+		if apiKey == "" {
+			apiKey = os.Getenv("OPENAI_API_KEY")
+		}
+		if apiKey == "" {
+			return nil, fmt.Errorf("openai-compatible: OPENAI_COMPAT_API_KEY (or OPENAI_API_KEY) not set (or pass --api-key)")
+		}
+		return provider.NewOpenAICompatible(apiKey, apiBase)
 	default:
 		return nil, fmt.Errorf("unknown provider %q (want: anthropic, openai, gemini, openai-compatible)", name)
 	}
