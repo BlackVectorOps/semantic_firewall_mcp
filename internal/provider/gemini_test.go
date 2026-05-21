@@ -123,8 +123,42 @@ func TestGeminiContentsFromMessages_ErrorToolResultLandsUnderError(t *testing.T)
 	if fr == nil {
 		t.Fatal("missing function response")
 	}
-	if _, ok := fr.Response["error"]; !ok {
+	if got, ok := fr.Response["error"].(string); !ok || got != "tool failed" {
 		t.Errorf("IsError tool_result not surfaced under 'error': %+v", fr.Response)
+	}
+}
+
+func TestGeminiContentsFromMessages_StructuredErrorPreservesPayload(t *testing.T) {
+	// Regression: when IsError=true AND the tool returned valid
+	// structured JSON, the original payload must survive under the
+	// "error" key rather than being coerced back to a raw string.
+	got, err := geminiContentsFromMessages([]Message{
+		{
+			Role: RoleUser,
+			Content: []ContentBlock{
+				{
+					Type:         BlockToolResult,
+					ToolResultID: "x",
+					ToolName:     "x",
+					ToolResult:   `{"status":"failed","detail":"db locked"}`,
+					IsError:      true,
+				},
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("convert: %v", err)
+	}
+	fr := got[0].Parts[0].FunctionResponse
+	if fr == nil {
+		t.Fatal("missing function response")
+	}
+	inner, ok := fr.Response["error"].(map[string]any)
+	if !ok {
+		t.Fatalf("expected fr.Response[\"error\"] to be a map; got %T: %+v", fr.Response["error"], fr.Response)
+	}
+	if got := inner["status"]; got != "failed" {
+		t.Errorf("structured error payload lost: inner=%+v", inner)
 	}
 }
 

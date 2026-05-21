@@ -198,12 +198,26 @@ func geminiContentsFromMessages(messages []Message) ([]*genai.Content, error) {
 				// tool's JSON output into that object; if the tool
 				// emitted a non-object (a primitive or array), wrap
 				// it under "output" so the SDK accepts the shape.
+				// On error we use "error" as the wrapping key so the
+				// model sees the failure clearly -- but if the tool
+				// returned valid structured JSON alongside IsError=true
+				// (an unusual but legitimate case), keep that JSON as
+				// the value of "error" rather than coercing it back to
+				// the raw text.
 				var resp map[string]any
-				if err := json.Unmarshal([]byte(b.ToolResult), &resp); err != nil {
-					resp = map[string]any{"output": b.ToolResult}
-				}
+				key := "output"
 				if b.IsError {
-					resp = map[string]any{"error": b.ToolResult}
+					key = "error"
+				}
+				var parsed any
+				if err := json.Unmarshal([]byte(b.ToolResult), &parsed); err != nil {
+					resp = map[string]any{key: b.ToolResult}
+				} else if obj, ok := parsed.(map[string]any); ok && !b.IsError {
+					// Successful object result: pass through as-is so
+					// the model sees the original keys.
+					resp = obj
+				} else {
+					resp = map[string]any{key: parsed}
 				}
 				parts = append(parts, &genai.Part{
 					FunctionResponse: &genai.FunctionResponse{
