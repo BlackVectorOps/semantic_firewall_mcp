@@ -13,5 +13,6 @@ func registerTools(s *server.MCPServer) {
 	s.AddTool(tools.NewDiffTool())
 	s.AddTool(tools.NewStatsTool())
 	s.AddTool(tools.NewTopologyTool())
-	// sfw_scan, sfw_check land in subsequent commits.
+	s.AddTool(tools.NewCheckTool())
+	// sfw_scan lands in the next commit.
 }

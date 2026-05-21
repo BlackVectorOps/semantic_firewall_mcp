@@ -286,6 +286,79 @@ func TestTopologyTool_SingleFunctionMode(t *testing.T) {
 	}
 }
 
+func TestCheckTool_FingerprintsOnly(t *testing.T) {
+	dir := t.TempDir()
+	// Two files so we can verify directory recursion and the per-file
+	// FileOutput shape both work.
+	if err := os.WriteFile(filepath.Join(dir, "a.go"), []byte(goSourceWithGoroutine), 0o644); err != nil {
+		t.Fatalf("write a: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "b.go"), []byte("package x\n\nfunc Add(a,b int) int { return a + b }\n"), 0o644); err != nil {
+		t.Fatalf("write b: %v", err)
+	}
+	// _test.go files must be skipped to match CLI behaviour.
+	if err := os.WriteFile(filepath.Join(dir, "z_test.go"), []byte("package x\n\nfunc IgnoreMe() {}\n"), 0o644); err != nil {
+		t.Fatalf("write test: %v", err)
+	}
+
+	res := callTool(t, "sfw_check", map[string]any{"target": dir})
+	if res.IsError {
+		t.Fatalf("sfw_check returned IsError=true: %s", textPayload(t, res))
+	}
+
+	var got []struct {
+		File      string `json:"file"`
+		Functions []struct {
+			Function    string `json:"function"`
+			Fingerprint string `json:"fingerprint"`
+		} `json:"functions"`
+		ScanResults  []any  `json:"scan_results"`
+		ErrorMessage string `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(textPayload(t, res)), &got); err != nil {
+		t.Fatalf("check unmarshal: %v\nbody:\n%s", err, textPayload(t, res))
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 files (test file skipped), got %d", len(got))
+	}
+
+	var sawIgnoreMe bool
+	for _, fo := range got {
+		if fo.ErrorMessage != "" {
+			t.Errorf("unexpected error on %s: %s", fo.File, fo.ErrorMessage)
+		}
+		if fo.ScanResults != nil {
+			t.Errorf("scan_results populated without db_path on %s", fo.File)
+		}
+		for _, fn := range fo.Functions {
+			if fn.Fingerprint == "" {
+				t.Errorf("missing fingerprint for %s::%s", fo.File, fn.Function)
+			}
+			if fn.Function == "IgnoreMe" {
+				sawIgnoreMe = true
+			}
+		}
+	}
+	if sawIgnoreMe {
+		t.Errorf("test file was scanned despite the _test.go filter")
+	}
+}
+
+func TestCheckTool_NoGoFiles(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("# nope"), 0o644); err != nil {
+		t.Fatalf("write readme: %v", err)
+	}
+
+	res := callTool(t, "sfw_check", map[string]any{"target": dir})
+	if !res.IsError {
+		t.Fatalf("expected IsError for directory with no Go files; body:\n%s", textPayload(t, res))
+	}
+	if got := textPayload(t, res); !strings.Contains(got, "no Go files") {
+		t.Errorf("error should mention 'no Go files', got: %s", got)
+	}
+}
+
 func TestTopologyTool_FunctionNotFound(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "src.go")
