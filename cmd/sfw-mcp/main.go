@@ -162,7 +162,16 @@ func buildProvider(name, apiKey, apiBase string) (provider.Provider, error) {
 		}
 		return provider.NewOpenAIWithBase(apiKey, apiBase), nil
 	case "gemini", "google":
-		return nil, fmt.Errorf("gemini provider lands in a subsequent commit")
+		if apiKey == "" {
+			apiKey = os.Getenv("GEMINI_API_KEY")
+		}
+		if apiKey == "" {
+			apiKey = os.Getenv("GOOGLE_API_KEY")
+		}
+		if apiKey == "" {
+			return nil, fmt.Errorf("gemini: GEMINI_API_KEY (or GOOGLE_API_KEY) not set (or pass --api-key)")
+		}
+		return provider.NewGemini(apiKey), nil
 	case "openai-compatible", "compat":
 		return nil, fmt.Errorf("openai-compatible provider lands in a subsequent commit")
 	default:
