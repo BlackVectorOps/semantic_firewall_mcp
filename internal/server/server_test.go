@@ -206,6 +206,105 @@ func TestStatsTool_EmptyPebbleDB(t *testing.T) {
 	}
 }
 
+// goSourceWithGoroutine exercises the "has_goroutine" digest field
+// and the multi-function case so the topology listing path is not
+// skipped by an empty file.
+const goSourceWithGoroutine = `package x
+
+func plain() int {
+	return 1
+}
+
+func spawner() {
+	go plain()
+}
+`
+
+func TestTopologyTool_DigestMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "src.go")
+	if err := os.WriteFile(path, []byte(goSourceWithGoroutine), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	res := callTool(t, "sfw_topology", map[string]any{"file_path": path})
+	if res.IsError {
+		t.Fatalf("sfw_topology returned IsError=true: %s", textPayload(t, res))
+	}
+
+	var got []struct {
+		Function string `json:"function"`
+		HasGo    bool   `json:"has_goroutine"`
+	}
+	if err := json.Unmarshal([]byte(textPayload(t, res)), &got); err != nil {
+		t.Fatalf("topology digest unmarshal: %v\nbody: %s", err, textPayload(t, res))
+	}
+	if len(got) < 2 {
+		t.Fatalf("expected at least 2 functions in digest, got %d", len(got))
+	}
+
+	var spawnerHasGo bool
+	var sawSpawner bool
+	for _, fn := range got {
+		if fn.Function == "spawner" {
+			sawSpawner = true
+			spawnerHasGo = fn.HasGo
+		}
+	}
+	if !sawSpawner {
+		t.Fatalf("spawner missing from digest: %+v", got)
+	}
+	if !spawnerHasGo {
+		t.Errorf("spawner.has_goroutine = false; want true (it `go plain()`s)")
+	}
+}
+
+func TestTopologyTool_SingleFunctionMode(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "src.go")
+	if err := os.WriteFile(path, []byte(goSourceWithGoroutine), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	res := callTool(t, "sfw_topology", map[string]any{
+		"file_path":     path,
+		"function_name": "spawner",
+	})
+	if res.IsError {
+		t.Fatalf("sfw_topology returned IsError=true: %s", textPayload(t, res))
+	}
+
+	// We don't assert on the exact FunctionTopology shape (it's wide and
+	// upstream may add fields); we just confirm the response is the
+	// single-function blob, not the array of digests.
+	body := textPayload(t, res)
+	if strings.HasPrefix(strings.TrimSpace(body), "[") {
+		t.Fatalf("single-function mode returned an array; expected object:\n%s", body)
+	}
+	if !strings.Contains(body, `"HasGo": true`) && !strings.Contains(body, `"has_go":true`) && !strings.Contains(body, `"HasGo":true`) {
+		t.Errorf("spawner topology should report a goroutine; body:\n%s", body)
+	}
+}
+
+func TestTopologyTool_FunctionNotFound(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "src.go")
+	if err := os.WriteFile(path, []byte(goSourceWithGoroutine), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+
+	res := callTool(t, "sfw_topology", map[string]any{
+		"file_path":     path,
+		"function_name": "doesNotExist",
+	})
+	if !res.IsError {
+		t.Fatalf("expected IsError=true for unknown function; got body:\n%s", textPayload(t, res))
+	}
+	if got := textPayload(t, res); !strings.Contains(got, "not found") {
+		t.Errorf("error should mention 'not found', got: %s", got)
+	}
+}
+
 func TestStatsTool_JSONBackend(t *testing.T) {
 	dir := t.TempDir()
 	dbPath := filepath.Join(dir, "sigs.json")
