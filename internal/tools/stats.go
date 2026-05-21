@@ -75,6 +75,11 @@ func readStats(dbPath string) (*statsResult, error) {
 
 	if strings.HasSuffix(dbPath, ".json") {
 		s := jsondb.NewScanner()
+		// jsondb.Scanner.Close is a no-op today, but defer-Close here
+		// keeps the call shape symmetrical with the PebbleDB branch
+		// below and survives any future Close implementation that
+		// actually releases something.
+		defer s.Close()
 		if err := s.LoadDatabase(dbPath); err != nil {
 			return nil, err
 		}

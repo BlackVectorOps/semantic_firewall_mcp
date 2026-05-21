@@ -162,6 +162,11 @@ func openScanner(dbPath string) (signatureScanner, error) {
 	if strings.HasSuffix(dbPath, ".json") {
 		s := jsondb.NewScanner()
 		if err := s.LoadDatabase(dbPath); err != nil {
+			// Close on the error path too. Today this is a no-op but
+			// it keeps the contract honest: every successful return
+			// pairs with a caller-side defer Close, every error
+			// return cleans up before bailing.
+			_ = s.Close()
 			return nil, err
 		}
 		return s, nil
