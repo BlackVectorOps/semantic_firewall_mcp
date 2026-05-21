@@ -1,0 +1,31 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+# Anchor with leading slash so we ignore the built binary, not the
+# cmd/sfw-mcp source directory.
+/sfw-mcp
+/cmd/sfw-mcp/sfw-mcp
+
+# Test artifacts
+*.test
+*.out
+coverage.html
+coverage.txt
+
+# Go workspace
+go.work
+go.work.sum
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+*.swo
+.DS_Store
+
+# Local env
+.env
+.env.local
