@@ -1,12 +1,16 @@
 package server
 
-import "github.com/mark3labs/mcp-go/server"
+import (
+	"github.com/BlackVectorOps/semantic_firewall_mcp/internal/tools"
+	"github.com/mark3labs/mcp-go/server"
+)
 
-// registerTools is the single place where every sfw tool gets attached to
-// the MCP server. Tool implementations live in internal/tools and are
-// wired up incrementally; the scaffold deliberately starts empty and is
-// filled in one tool per commit.
-func registerTools(_ *server.MCPServer) {
-	// sfw_diff, sfw_scan, sfw_check, sfw_topology, sfw_stats land in
-	// subsequent commits.
+// registerTools is the single place where every sfw tool gets attached
+// to the MCP server. Each tool constructor in internal/tools returns
+// the (Tool, Handler) pair; doing the wiring here keeps server.go
+// transport-only and lets tests register a subset by hand.
+func registerTools(s *server.MCPServer) {
+	s.AddTool(tools.NewDiffTool())
+	// sfw_scan, sfw_check, sfw_topology, sfw_stats land in subsequent
+	// commits.
 }
