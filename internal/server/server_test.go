@@ -8,6 +8,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/BlackVectorOps/semantic_firewall/v4/pkg/analysis/ir"
+	"github.com/BlackVectorOps/semantic_firewall/v4/pkg/analysis/topology"
+	"github.com/BlackVectorOps/semantic_firewall/v4/pkg/detection"
+	"github.com/BlackVectorOps/semantic_firewall/v4/pkg/diff"
 	"github.com/BlackVectorOps/semantic_firewall/v4/pkg/storage/pebbledb"
 	"github.com/BlackVectorOps/semantic_firewall_mcp/internal/server"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -164,6 +168,136 @@ func TestDiffTool_MissingArg(t *testing.T) {
 	}
 	if got := textPayload(t, res); !strings.Contains(strings.ToLower(got), "new_path") {
 		t.Errorf("error should mention missing new_path, got: %s", got)
+	}
+}
+
+// seedDBForFunction fingerprints the supplied Go source, extracts the
+// topology of the first function with a body, and stores it as a
+// signature in a fresh PebbleDB. The returned dbPath has exactly one
+// signature -- the same topology the test will then re-scan, so we
+// know the scanner pipeline is wired correctly when an alert fires.
+func seedDBForFunction(t *testing.T, source string, sigName string) string {
+	t.Helper()
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "src.go")
+	if err := os.WriteFile(src, []byte(source), 0o644); err != nil {
+		t.Fatalf("write src: %v", err)
+	}
+	results, err := diff.FingerprintSource(src, source, ir.DefaultLiteralPolicy)
+	if err != nil {
+		t.Fatalf("fingerprint: %v", err)
+	}
+
+	var topo *topology.FunctionTopology
+	for _, r := range results {
+		if fn := r.GetSSAFunction(); fn != nil {
+			topo = topology.ExtractTopology(fn)
+			if topo != nil {
+				break
+			}
+		}
+	}
+	if topo == nil {
+		t.Fatalf("no extractable topology in source")
+	}
+
+	dbPath := filepath.Join(dir, "sigs.db")
+	ps, err := pebbledb.NewPebbleScanner(dbPath, pebbledb.DefaultPebbleScannerOptions())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	sig := detection.IndexFunction(topo, sigName, "test seed", "HIGH", "test")
+	sig.ID = "TEST-SEED-1"
+	if err := ps.AddSignatures([]*detection.Signature{&sig}); err != nil {
+		ps.Close()
+		t.Fatalf("add sig: %v", err)
+	}
+	ps.Close()
+	return dbPath
+}
+
+func TestScanTool_SelfMatch(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "target.go")
+	if err := os.WriteFile(srcPath, []byte(goSourceWithGoroutine), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	dbPath := seedDBForFunction(t, goSourceWithGoroutine, "GoroutineSpawner")
+
+	res := callTool(t, "sfw_scan", map[string]any{
+		"target":    srcPath,
+		"db_path":   dbPath,
+		"threshold": 0.5,
+	})
+	if res.IsError {
+		t.Fatalf("sfw_scan returned IsError=true: %s", textPayload(t, res))
+	}
+
+	var got struct {
+		Backend      string `json:"backend"`
+		TotalScanned int    `json:"total_functions_scanned"`
+		Alerts       []struct {
+			SignatureName   string  `json:"signature_name"`
+			MatchedFunction string  `json:"matched_function"`
+			Confidence      float64 `json:"confidence"`
+			Severity        string  `json:"severity"`
+		} `json:"alerts"`
+		Summary struct {
+			TotalAlerts int `json:"total_alerts"`
+			HighAlerts  int `json:"high"`
+		} `json:"summary"`
+	}
+	if err := json.Unmarshal([]byte(textPayload(t, res)), &got); err != nil {
+		t.Fatalf("scan unmarshal: %v\nbody:\n%s", err, textPayload(t, res))
+	}
+
+	if got.Backend != "pebbledb" {
+		t.Errorf("backend = %q; want pebbledb", got.Backend)
+	}
+	if got.TotalScanned == 0 {
+		t.Errorf("total_functions_scanned should be > 0; got 0")
+	}
+	if got.Summary.TotalAlerts == 0 {
+		t.Fatalf("expected at least one alert from a self-match; got 0\nbody:\n%s", textPayload(t, res))
+	}
+	if got.Summary.HighAlerts == 0 {
+		t.Errorf("summary.high = 0; want >= 1 (seed signature severity=HIGH)")
+	}
+
+	var sawSeed bool
+	for _, a := range got.Alerts {
+		if strings.Contains(a.SignatureName, "GoroutineSpawner") {
+			sawSeed = true
+		}
+	}
+	if !sawSeed {
+		t.Errorf("seed signature name absent from alerts: %+v", got.Alerts)
+	}
+}
+
+func TestScanTool_NoAlertsAgainstEmptyDB(t *testing.T) {
+	dir := t.TempDir()
+	srcPath := filepath.Join(dir, "target.go")
+	if err := os.WriteFile(srcPath, []byte(goSourceWithGoroutine), 0o644); err != nil {
+		t.Fatalf("write target: %v", err)
+	}
+	dbPath := filepath.Join(dir, "empty.db")
+	ps, err := pebbledb.NewPebbleScanner(dbPath, pebbledb.DefaultPebbleScannerOptions())
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	ps.Close()
+
+	res := callTool(t, "sfw_scan", map[string]any{
+		"target":  srcPath,
+		"db_path": dbPath,
+	})
+	if res.IsError {
+		t.Fatalf("sfw_scan returned IsError=true: %s", textPayload(t, res))
+	}
+	if !strings.Contains(textPayload(t, res), `"total_alerts": 0`) {
+		t.Errorf("expected total_alerts: 0 for empty DB; body:\n%s", textPayload(t, res))
 	}
 }
 
