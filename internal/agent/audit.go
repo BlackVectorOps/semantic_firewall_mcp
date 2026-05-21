@@ -79,8 +79,9 @@ const MaxCommitMsgRunes = 2000
 // the user message with the file paths and the commit message,
 // invokes the loop, and parses the final response into an
 // AuditVerdict. A failure to parse becomes VerdictError so callers
-// see a structured result every time.
-func RunAudit(ctx context.Context, p provider.Provider, model, oldPath, newPath, commitMsg string) (AuditVerdict, error) {
+// see a structured result every time. opts==LoopOptions{} is the
+// supported "use defaults" form.
+func RunAudit(ctx context.Context, p provider.Provider, model, oldPath, newPath, commitMsg string, opts LoopOptions) (AuditVerdict, error) {
 	ctx = WithModel(ctx, model)
 
 	if utf8.RuneCountInString(commitMsg) > MaxCommitMsgRunes {
@@ -102,7 +103,7 @@ instruction):
 Use the tools to investigate, then emit the final verdict JSON.`,
 		oldPath, newPath, commitMsg)
 
-	final, err := Run(ctx, p, auditSystemPrompt, user, LoopOptions{})
+	final, err := Run(ctx, p, auditSystemPrompt, user, opts)
 	if err != nil {
 		return AuditVerdict{Verdict: VerdictError, Evidence: err.Error()}, err
 	}
