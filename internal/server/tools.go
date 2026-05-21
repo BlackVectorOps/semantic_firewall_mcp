@@ -5,14 +5,9 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 )
 
-// registerTools is the single place where every sfw tool gets attached
-// to the MCP server. Each tool constructor in internal/tools returns
-// the (Tool, Handler) pair; doing the wiring here keeps server.go
-// transport-only and lets tests register a subset by hand.
+// registerTools attaches the canonical tool list to the MCP server.
+// The list itself lives in internal/tools.All so the in-process agent
+// can iterate it too and never drift from the published surface.
 func registerTools(s *server.MCPServer) {
-	s.AddTool(tools.NewDiffTool())
-	s.AddTool(tools.NewStatsTool())
-	s.AddTool(tools.NewTopologyTool())
-	s.AddTool(tools.NewCheckTool())
-	s.AddTool(tools.NewScanTool())
+	s.AddTools(tools.All()...)
 }
