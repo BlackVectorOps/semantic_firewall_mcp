@@ -154,7 +154,13 @@ func buildProvider(name, apiKey, apiBase string) (provider.Provider, error) {
 		}
 		return provider.NewAnthropic(apiKey), nil
 	case "openai", "gpt":
-		return nil, fmt.Errorf("openai provider lands in the next commit")
+		if apiKey == "" {
+			apiKey = os.Getenv("OPENAI_API_KEY")
+		}
+		if apiKey == "" {
+			return nil, fmt.Errorf("openai: OPENAI_API_KEY not set (or pass --api-key)")
+		}
+		return provider.NewOpenAIWithBase(apiKey, apiBase), nil
 	case "gemini", "google":
 		return nil, fmt.Errorf("gemini provider lands in a subsequent commit")
 	case "openai-compatible", "compat":
