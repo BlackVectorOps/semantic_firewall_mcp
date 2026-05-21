@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/BlackVectorOps/semantic_firewall/v4/pkg/storage/pebbledb"
 	"github.com/BlackVectorOps/semantic_firewall_mcp/internal/server"
 	"github.com/mark3labs/mcp-go/mcp"
 )
@@ -163,5 +164,76 @@ func TestDiffTool_MissingArg(t *testing.T) {
 	}
 	if got := textPayload(t, res); !strings.Contains(strings.ToLower(got), "new_path") {
 		t.Errorf("error should mention missing new_path, got: %s", got)
+	}
+}
+
+func TestStatsTool_EmptyPebbleDB(t *testing.T) {
+	// NewPebbleScanner on a fresh tempdir creates an empty DB with the
+	// current schema; closing it then re-opening read-only via the
+	// tool exercises the same path the CLI takes.
+	dbPath := t.TempDir()
+	ps, err := pebbledb.NewPebbleScanner(dbPath, pebbledb.DefaultPebbleScannerOptions())
+	if err != nil {
+		t.Fatalf("seed pebbledb: %v", err)
+	}
+	ps.Close()
+
+	res := callTool(t, "sfw_stats", map[string]any{"db_path": dbPath})
+	if res.IsError {
+		t.Fatalf("sfw_stats returned IsError=true: %s", textPayload(t, res))
+	}
+
+	var got struct {
+		Backend        string `json:"backend"`
+		Database       string `json:"database"`
+		SignatureCount int    `json:"signature_count"`
+		FileSizeBytes  int64  `json:"file_size_bytes"`
+	}
+	if err := json.Unmarshal([]byte(textPayload(t, res)), &got); err != nil {
+		t.Fatalf("stats JSON unmarshal: %v", err)
+	}
+	if got.Backend != "pebbledb" {
+		t.Errorf("backend = %q; want pebbledb", got.Backend)
+	}
+	if got.Database != dbPath {
+		t.Errorf("database = %q; want %q", got.Database, dbPath)
+	}
+	if got.SignatureCount != 0 {
+		t.Errorf("signature_count = %d; want 0 for empty DB", got.SignatureCount)
+	}
+	if got.FileSizeBytes <= 0 {
+		t.Errorf("file_size_bytes should be > 0 for an initialised DB, got %d", got.FileSizeBytes)
+	}
+}
+
+func TestStatsTool_JSONBackend(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "sigs.json")
+	body := []byte(`{"version":"1.0","signatures":[{"id":"X1"},{"id":"X2"}]}`)
+	if err := os.WriteFile(dbPath, body, 0o600); err != nil {
+		t.Fatalf("write json db: %v", err)
+	}
+
+	res := callTool(t, "sfw_stats", map[string]any{"db_path": dbPath})
+	if res.IsError {
+		t.Fatalf("sfw_stats returned IsError=true: %s", textPayload(t, res))
+	}
+
+	var got struct {
+		Backend        string `json:"backend"`
+		SignatureCount int    `json:"signature_count"`
+		Version        string `json:"version"`
+	}
+	if err := json.Unmarshal([]byte(textPayload(t, res)), &got); err != nil {
+		t.Fatalf("stats JSON unmarshal: %v", err)
+	}
+	if got.Backend != "json" {
+		t.Errorf("backend = %q; want json", got.Backend)
+	}
+	if got.SignatureCount != 2 {
+		t.Errorf("signature_count = %d; want 2", got.SignatureCount)
+	}
+	if got.Version != "1.0" {
+		t.Errorf("version = %q; want 1.0", got.Version)
 	}
 }

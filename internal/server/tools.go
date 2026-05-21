@@ -11,6 +11,6 @@ import (
 // transport-only and lets tests register a subset by hand.
 func registerTools(s *server.MCPServer) {
 	s.AddTool(tools.NewDiffTool())
-	// sfw_scan, sfw_check, sfw_topology, sfw_stats land in subsequent
-	// commits.
+	s.AddTool(tools.NewStatsTool())
+	// sfw_scan, sfw_check, sfw_topology land in subsequent commits.
 }
