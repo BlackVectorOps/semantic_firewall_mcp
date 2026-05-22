@@ -2,11 +2,12 @@ module github.com/BlackVectorOps/semantic_firewall_mcp
 
 go 1.26.3
 
-replace github.com/BlackVectorOps/semantic_firewall/v4 => ../semantic_firewall
-
 require (
-	github.com/BlackVectorOps/semantic_firewall/v4 v4.0.0-00010101000000-000000000000
+	github.com/BlackVectorOps/semantic_firewall/v4 v4.0.0
+	github.com/anthropics/anthropic-sdk-go v1.45.0
 	github.com/mark3labs/mcp-go v0.54.0
+	github.com/openai/openai-go v1.12.0
+	google.golang.org/genai v1.57.0
 )
 
 require (
@@ -14,7 +15,6 @@ require (
 	cloud.google.com/go/auth v0.18.1 // indirect
 	cloud.google.com/go/compute/metadata v0.9.0 // indirect
 	github.com/DataDog/zstd v1.5.7 // indirect
-	github.com/anthropics/anthropic-sdk-go v1.45.0 // indirect
 	github.com/bahlo/generic-list-go v0.2.0 // indirect
 	github.com/beorn7/perks v1.0.1 // indirect
 	github.com/buger/jsonparser v1.1.2 // indirect
@@ -44,7 +44,6 @@ require (
 	github.com/kr/text v0.2.0 // indirect
 	github.com/mailru/easyjson v0.7.7 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/openai/openai-go v1.12.0 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_golang v1.23.2 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
@@ -74,7 +73,6 @@ require (
 	golang.org/x/sys v0.40.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/tools v0.41.0 // indirect
-	google.golang.org/genai v1.57.0 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260128011058-8636f8732409 // indirect
 	google.golang.org/grpc v1.80.0 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
