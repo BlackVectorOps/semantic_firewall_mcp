@@ -125,13 +125,25 @@ much of each they want to act on:
 }
 ```
 
-Three things to know about the shape:
+Four things to know about the shape:
 
 - **`risk_evidence` is computed without invoking an LLM.** The
   `deterministic_verdict` field is `CLEAN`, `ESCALATION`, or
   `SIGNATURE_MATCH` — a math-only operator can gate on this alone
-  and never pay for a model call. `SIGNATURE_MATCH` strictly
-  dominates `ESCALATION` when both fire.
+  and never pay for a model call. (The computation lives in a
+  sealed Go package that cannot import the LLM path; see
+  [Deterministic / LLM boundary](#deterministic--llm-boundary)
+  below for the structural enforcement.) `SIGNATURE_MATCH` strictly
+  dominates `ESCALATION` when both fire — a named-pattern match is
+  a stronger claim than a heuristic score.
+- **`high_risk_functions[].status` is one of `added`, `modified`,
+  or `renamed`.** `preserved` functions carry a score of 0 by
+  definition, and `removed` functions are not scored (we cannot
+  meaningfully assign risk to code that no longer exists in the
+  diff); neither surfaces here. If you need to flag suspicious
+  deletions ("backdoor removed to cover tracks"), inspect
+  `removed_functions` in the count fields and use `sfw_topology`
+  on the pre-change file separately.
 - **`llm_assessments` is an array even though only one provider runs
   today.** Cross-provider mode (planned) appends a second entry; the
   array shape is intentional so that addition is purely additive
@@ -140,6 +152,47 @@ Three things to know about the shape:
   outages, max-token aborts, and step-budget exhaustion. The
   runaway-bill failure mode (an audit that died at step 7 reporting
   zero spend) does not exist.
+
+When the signature database is populated (the curated threat-intel
+feed; not yet shipped) and a function's topology matches a known
+malware family, the output shape looks like this:
+
+```json
+{
+  "risk_evidence": {
+    "added_functions": 0,
+    "modified_functions": 1,
+    "removed_functions": 0,
+    "high_risk_functions": [
+      {
+        "function": "init",
+        "risk_score": 32,
+        "topology_delta": "Calls+3, Goroutine, Entropy+4.2",
+        "status": "modified"
+      }
+    ],
+    "signature_hits": [
+      {
+        "function": "init",
+        "signature_id": "SFW-MAL-COBALT-Beacon-2026-01",
+        "signature_name": "CobaltStrike_Beacon_v1",
+        "severity": "CRITICAL",
+        "confidence": 0.94
+      }
+    ],
+    "deterministic_verdict": "SIGNATURE_MATCH"
+  },
+  "llm_assessments": [ /* ... */ ],
+  "cost": { /* ... */ }
+}
+```
+
+Note that the function appears in both `high_risk_functions` (the
+topology delta crosses the heuristic threshold) and
+`signature_hits` (a named pattern matched). The dominance rule
+applies only to `deterministic_verdict`, not to the lists — both
+arrays carry the same function so the operator can see the
+heuristic reasoning that corroborated the signature.
 
 ### Exit codes
 
@@ -154,7 +207,17 @@ infrastructure failure:
 
 A workflow that wants to fail-soft on infra outages keys on
 `exit == 2`. A workflow that strictly trusts the tool treats `!= 0`
-as a block, same as before.
+as a block.
+
+**Migration note from v0.1.x:** Gates written as `if exit == 1`
+will no longer catch ERROR cases, which moved to exit `2` in v0.2.
+The v0.1 README actively encouraged that one-equals-blocked shape
+("0 for MATCH, 1 for SUSPICIOUS / LIE / ERROR"), so the breakage
+is real and silent — your CI will keep reporting green on provider
+outages it used to flag. Rewrite as `if exit != 0` to preserve the
+v0.1 block-everything behaviour, or as `if exit != 0 && exit != 2`
+to opt into the new fail-soft-on-infra semantics. This breakage is
+the load-bearing reason for the v0.2.0 semver-major bump.
 
 ### Provider matrix
 
@@ -216,16 +279,21 @@ field is consistently being clipped.
             └───────────────────────────────────────────────┘
 ```
 
-**Deterministic / LLM boundary.** The `audit` output's `risk_evidence`
-side is computed by `internal/risk`, which is a sealed package: it
-cannot import `internal/provider` or `internal/agent`. The Go
-compiler enforces that boundary, not a comment — anything in
-`risk_evidence` is provably free of LLM context, so the math-only
-operator's gate continues to function during provider outages.
+### Deterministic / LLM boundary
+
+The `audit` output's `risk_evidence` side is computed by
+`internal/risk`, which is a sealed Go package: it cannot import
+`internal/provider` or `internal/agent`. The Go compiler enforces
+that boundary, not a comment — anything in `risk_evidence` is
+provably free of LLM context, so the math-only operator's gate
+continues to function during provider outages.
+
 That separation is also the structural line between the free
 analysis core (`internal/risk` + the open-source engine in
 `semantic_firewall`) and any future paid surface (curated intel
-feeds, premium judgment modes).
+feeds, premium judgment modes). A future contributor who tried to
+cross the line would not get a code-review nit; they would get a
+build failure.
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design rationale,
 including why this is a separate repo and what is intentionally out
