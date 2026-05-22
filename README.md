@@ -23,13 +23,15 @@ Confirm the install:
 ```bash
 $ sfw-mcp version
 Semantic Firewall MCP
-Build: v0.1.2
+Build: v0.2.1
 Engine: v4.0.0
 ```
 
 `Build` is this binary; `Engine` is the linked `semantic_firewall`
 library version. Both come from the embedded Go build info — no
-hardcoded constants, no separate release manifest.
+hardcoded constants, no separate release manifest. (Your `Build`
+value will be whichever tag you installed; the version banner is
+not a release-note placeholder.)
 
 ## Use it as an MCP server
 
@@ -69,7 +71,7 @@ of an LLM tool call is bounded to "compute something and return JSON".
 
 `audit` runs an internal agent loop against the provider you select.
 The agent calls the same tools an external MCP client would, then
-emits a verdict JSON on stdout.
+emits a structured JSON report on stdout.
 
 ```bash
 sfw-mcp audit old.go new.go "fix typo" \
@@ -77,8 +79,82 @@ sfw-mcp audit old.go new.go "fix typo" \
   --model claude-opus-4-7
 ```
 
-Exit code mirrors v3's `sfw audit`: **0 for MATCH**, **1 for
-SUSPICIOUS / LIE / ERROR**.
+### Output shape
+
+The audit response separates **deterministic, math-only signals**
+from **non-deterministic LLM judgment** so operators can choose how
+much of each they want to act on:
+
+```json
+{
+  "inputs": {
+    "old_file": "old.go",
+    "new_file": "new.go",
+    "commit_message": "fix typo"
+  },
+  "risk_evidence": {
+    "added_functions": 1,
+    "modified_functions": 1,
+    "removed_functions": 0,
+    "high_risk_functions": [
+      {
+        "function": "F",
+        "risk_score": 15,
+        "topology_delta": "Calls+1, Goroutine",
+        "status": "modified"
+      }
+    ],
+    "signature_hits": [],
+    "deterministic_verdict": "ESCALATION"
+  },
+  "llm_assessments": [
+    {
+      "provider": "anthropic",
+      "model": "claude-opus-4-7",
+      "verdict": "LIE",
+      "evidence": "Commit message claims 'fix typo' but the diff introduces a goroutine."
+    }
+  ],
+  "cost": {
+    "tool_calls": 2,
+    "model_steps": 3,
+    "input_tokens": 6420,
+    "output_tokens": 184,
+    "cache_read_tokens": 4096
+  }
+}
+```
+
+Three things to know about the shape:
+
+- **`risk_evidence` is computed without invoking an LLM.** The
+  `deterministic_verdict` field is `CLEAN`, `ESCALATION`, or
+  `SIGNATURE_MATCH` — a math-only operator can gate on this alone
+  and never pay for a model call. `SIGNATURE_MATCH` strictly
+  dominates `ESCALATION` when both fire.
+- **`llm_assessments` is an array even though only one provider runs
+  today.** Cross-provider mode (planned) appends a second entry; the
+  array shape is intentional so that addition is purely additive
+  rather than another breaking schema change.
+- **`cost` is populated on every return path**, including provider
+  outages, max-token aborts, and step-budget exhaustion. The
+  runaway-bill failure mode (an audit that died at step 7 reporting
+  zero spend) does not exist.
+
+### Exit codes
+
+Tri-state, so a CI workflow can distinguish a real verdict from an
+infrastructure failure:
+
+| Code | Meaning |
+|------|---------|
+| `0`  | `MATCH` — commit message accurately describes the change. |
+| `1`  | `LIE` or `SUSPICIOUS` — the tool has an opinion. |
+| `2`  | `ERROR` — the tool itself broke (provider outage, parse failure, step budget exhausted). |
+
+A workflow that wants to fail-soft on infra outages keys on
+`exit == 2`. A workflow that strictly trusts the tool treats `!= 0`
+as a block, same as before.
 
 ### Provider matrix
 
@@ -139,6 +215,17 @@ field is consistently being clipped.
             │  └──────────────────────────────────────────┘ │
             └───────────────────────────────────────────────┘
 ```
+
+**Deterministic / LLM boundary.** The `audit` output's `risk_evidence`
+side is computed by `internal/risk`, which is a sealed package: it
+cannot import `internal/provider` or `internal/agent`. The Go
+compiler enforces that boundary, not a comment — anything in
+`risk_evidence` is provably free of LLM context, so the math-only
+operator's gate continues to function during provider outages.
+That separation is also the structural line between the free
+analysis core (`internal/risk` + the open-source engine in
+`semantic_firewall`) and any future paid surface (curated intel
+feeds, premium judgment modes).
 
 See [`docs/DESIGN.md`](docs/DESIGN.md) for the full design rationale,
 including why this is a separate repo and what is intentionally out
