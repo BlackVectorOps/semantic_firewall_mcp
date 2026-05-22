@@ -125,7 +125,7 @@ much of each they want to act on:
 }
 ```
 
-Four things to know about the shape:
+Five things to know about the shape:
 
 - **`risk_evidence` is computed without invoking an LLM.** The
   `deterministic_verdict` field is `CLEAN`, `ESCALATION`, or
@@ -137,13 +137,30 @@ Four things to know about the shape:
   dominates `ESCALATION` when both fire — a named-pattern match is
   a stronger claim than a heuristic score.
 - **`high_risk_functions[].status` is one of `added`, `modified`,
-  or `renamed`.** `preserved` functions carry a score of 0 by
-  definition, and `removed` functions are not scored (we cannot
-  meaningfully assign risk to code that no longer exists in the
-  diff); neither surfaces here. If you need to flag suspicious
-  deletions ("backdoor removed to cover tracks"), inspect
-  `removed_functions` in the count fields and use `sfw_topology`
-  on the pre-change file separately.
+  or `renamed`.** Note the asymmetry against the top-level
+  `removed_functions` count: that count tallies every removed
+  function in the diff, while `high_risk_functions[]` is the
+  filtered list of entries that crossed the risk threshold.
+  Removed functions are *counted* but not *scored* (we cannot
+  meaningfully assign risk to a topology that no longer exists in
+  the diff), so `removed_functions` can be non-zero while no entry
+  in `high_risk_functions[]` carries `status: removed`. `preserved`
+  functions similarly score 0 by definition and never reach the
+  list.
+- **Known limitation: deletion-attack blind spot.** The
+  deterministic verdict scores what a commit *added*, not what it
+  *removed*. A backdoor introduced by deleting a guard — removing
+  a bounds check, stripping an auth verification, dropping a TLS
+  validation — does not surface in `high_risk_functions[]`, and
+  `deterministic_verdict` will not flag it. The LLM assessment may
+  catch it if the model investigates the deletion, but that is not
+  a deterministic guarantee. To audit suspicious deletions
+  manually, point `sfw_topology` at the pre-change file (`old.go`)
+  and look for calls or guards the commit message did not justify
+  removing. Closing this gap properly requires scoring loss of
+  structure, which the v0 engine does not yet do; naming it here
+  rather than hiding it is the honest posture until the engine can
+  catch it deterministically.
 - **`llm_assessments` is an array even though only one provider runs
   today.** Cross-provider mode (planned) appends a second entry; the
   array shape is intentional so that addition is purely additive
