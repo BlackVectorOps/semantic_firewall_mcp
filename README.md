@@ -10,17 +10,26 @@ LLM provider of your choice (Anthropic, OpenAI, Gemini, or any
 OpenAI-compatible endpoint) to investigate whether a commit message
 matches its structural changes.
 
-> **Status:** unreleased. Built against `semantic_firewall` v4, which
-> itself is gated on this server landing. During development the
-> module uses a local `replace` directive against
-> `../semantic_firewall`; the v4.0.0 tag will drop the replace and
-> pin the real version.
+Pairs with [`semantic_firewall`](https://github.com/BlackVectorOps/semantic_firewall) `v4.0.0+`.
 
 ## Install
 
 ```bash
 go install github.com/BlackVectorOps/semantic_firewall_mcp/cmd/sfw-mcp@latest
 ```
+
+Confirm the install:
+
+```bash
+$ sfw-mcp version
+Semantic Firewall MCP
+Build: v0.1.2
+Engine: v4.0.0
+```
+
+`Build` is this binary; `Engine` is the linked `semantic_firewall`
+library version. Both come from the embedded Go build info — no
+hardcoded constants, no separate release manifest.
 
 ## Use it as an MCP server
 
