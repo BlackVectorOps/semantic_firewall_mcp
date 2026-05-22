@@ -13,6 +13,7 @@ import (
 	"github.com/BlackVectorOps/semantic_firewall_mcp/internal/agent"
 	"github.com/BlackVectorOps/semantic_firewall_mcp/internal/provider"
 	"github.com/BlackVectorOps/semantic_firewall_mcp/internal/server"
+	"github.com/BlackVectorOps/semantic_firewall_mcp/internal/version"
 )
 
 func usage() {
@@ -61,7 +62,7 @@ func main() {
 		}
 
 	case "version", "-v", "--version":
-		fmt.Println("sfw-mcp v4.0.0-dev")
+		fmt.Println(version.String())
 
 	case "-h", "--help":
 		usage()
