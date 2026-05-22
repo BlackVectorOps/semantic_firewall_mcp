@@ -76,8 +76,12 @@ const (
 )
 
 // auditSystemPrompt is the static instruction the agent runs under.
-// It tells the model the diff has already been pre-computed so the
-// model does not waste a tool call recomputing it.
+// It describes the model's task and judgment criteria only --
+// nothing about how the conversation was assembled. Plumbing details
+// (e.g. that we seed the diff into turn 1 as a synthetic tool_use)
+// belong in code, not in prompt prose: encoding them here couples
+// the prompt to internal harness implementation and would drift
+// silently if RunAudit ever changes its seeding strategy.
 const auditSystemPrompt = `You are the Semantic Firewall audit agent.
 
 Your job: decide whether a commit message accurately describes the
@@ -85,11 +89,6 @@ structural changes the diff actually makes to a Go program, and
 flag deceptive commits that hide risky changes (network calls,
 shells, goroutine spawns, packed payloads) behind innocuous-sounding
 descriptions.
-
-The first tool result you see in this conversation is a pre-computed
-sfw_diff for the audit's primary file pair. You may call sfw_diff
-again only on OTHER file pairs you want to investigate -- do not
-call it on the primary pair, the result is already in front of you.
 
 You have these tools, all read-only:
 
@@ -208,10 +207,7 @@ instruction):
 %s
 ---
 
-The sfw_diff result for these two files is already in your context
-as the first tool result. Use the other tools (sfw_topology,
-sfw_scan, sfw_check) to investigate further, then emit the final
-verdict JSON.`,
+Investigate with the available tools, then emit the final verdict JSON.`,
 		oldPath, newPath, commitMsg)
 
 	final, usage, runErr := Run(ctx, p, auditSystemPrompt, user, seed, opts)
