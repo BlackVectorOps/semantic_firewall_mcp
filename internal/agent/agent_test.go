@@ -48,7 +48,7 @@ func TestRun_EndTurnImmediately(t *testing.T) {
 			},
 		},
 	}
-	got, err := Run(context.Background(), p, "sys", "user", LoopOptions{})
+	got, _, err := Run(context.Background(), p, "sys", "user", nil, LoopOptions{})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -119,7 +119,7 @@ func TestRun_ToolUseRoundTrip(t *testing.T) {
 		},
 	}
 
-	got, err := Run(context.Background(), p, "sys", "audit", LoopOptions{})
+	got, usage, err := Run(context.Background(), p, "sys", "audit", nil, LoopOptions{})
 	if err != nil {
 		t.Fatalf("Run: %v", err)
 	}
@@ -158,6 +158,17 @@ func TestRun_ToolUseRoundTrip(t *testing.T) {
 	if !strings.Contains(last.Content[0].ToolResult, `"old_file"`) {
 		t.Errorf("tool_result not a DiffOutput JSON: %s", last.Content[0].ToolResult)
 	}
+
+	// Usage must reflect the two model calls plus the one tool_use
+	// the model emitted across them. Token counts are zero (the
+	// scripted provider does not populate Usage) but the counters
+	// must still be accurate.
+	if usage.ModelSteps != 2 {
+		t.Errorf("usage.ModelSteps = %d; want 2", usage.ModelSteps)
+	}
+	if usage.ToolCalls != 1 {
+		t.Errorf("usage.ToolCalls = %d; want 1", usage.ToolCalls)
+	}
 }
 
 func TestRun_UnknownToolReportsErrorResult(t *testing.T) {
@@ -181,7 +192,7 @@ func TestRun_UnknownToolReportsErrorResult(t *testing.T) {
 			},
 		},
 	}
-	if _, err := Run(context.Background(), p, "sys", "audit", LoopOptions{}); err != nil {
+	if _, _, err := Run(context.Background(), p, "sys", "audit", nil, LoopOptions{}); err != nil {
 		t.Fatalf("Run should swallow unknown-tool as a tool_result, not error: %v", err)
 	}
 	// The second turn must contain a tool_result marked IsError.
@@ -212,12 +223,92 @@ func TestRun_StepBudgetExhausted(t *testing.T) {
 		t:         t,
 		responses: []*provider.Response{toolUseTurn, toolUseTurn, toolUseTurn},
 	}
-	_, err := Run(context.Background(), p, "sys", "audit", LoopOptions{MaxSteps: 3})
+	_, usage, err := Run(context.Background(), p, "sys", "audit", nil, LoopOptions{MaxSteps: 3})
 	if err == nil {
 		t.Fatal("expected step-budget exhaustion error, got nil")
 	}
 	if !strings.Contains(err.Error(), "step budget") {
 		t.Errorf("error should mention step budget; got: %v", err)
+	}
+	// Usage must survive the abort: 3 model steps and 3 tool_use
+	// blocks the model emitted before the budget tripped. This is
+	// the "runaway-bill hides in the failure path" hole closing.
+	if usage.ModelSteps != 3 {
+		t.Errorf("usage.ModelSteps after abort = %d; want 3", usage.ModelSteps)
+	}
+	if usage.ToolCalls != 3 {
+		t.Errorf("usage.ToolCalls after abort = %d; want 3", usage.ToolCalls)
+	}
+}
+
+// TestRun_UsageSurvivesMaxTokens pins the second failure path -- a
+// model emits StopReasonMaxTokens before producing a final verdict
+// and we must still surface the usage accumulated up to that point.
+// Without this guarantee, an audit that died at step 7 of 8 would
+// report zero cost, which is the worst possible reporting bug for a
+// paid CI tool.
+func TestRun_UsageSurvivesMaxTokens(t *testing.T) {
+	p := &scriptedProvider{
+		t: t,
+		responses: []*provider.Response{
+			{
+				StopReason: provider.StopReasonMaxTokens,
+				Content:    []provider.ContentBlock{{Type: provider.BlockText, Text: "I was about to"}},
+				Usage:      provider.Usage{InputTokens: 1234, OutputTokens: 2048},
+			},
+		},
+	}
+	_, usage, err := Run(context.Background(), p, "sys", "audit", nil, LoopOptions{})
+	if err == nil {
+		t.Fatal("expected max_tokens error, got nil")
+	}
+	if usage.ModelSteps != 1 {
+		t.Errorf("usage.ModelSteps = %d; want 1", usage.ModelSteps)
+	}
+	if usage.ProviderUsage.InputTokens != 1234 || usage.ProviderUsage.OutputTokens != 2048 {
+		t.Errorf("token counts lost across abort: in=%d out=%d", usage.ProviderUsage.InputTokens, usage.ProviderUsage.OutputTokens)
+	}
+}
+
+// TestRun_SeedInjectedAfterUserTurn pins the contract that
+// audit.RunAudit relies on: seed messages land between the initial
+// user turn and the first provider call. If the placement ever
+// regresses to "before user" or "appended at end", the model would
+// see a fabricated tool call without the context that motivated it
+// and the conversation becomes invalid for OpenAI / Gemini.
+func TestRun_SeedInjectedAfterUserTurn(t *testing.T) {
+	seed := []provider.Message{
+		{Role: provider.RoleAssistant, Content: []provider.ContentBlock{
+			{Type: provider.BlockToolUse, ToolUseID: "seed_1", ToolName: "sfw_diff", ToolInput: json.RawMessage(`{}`)},
+		}},
+		{Role: provider.RoleUser, Content: []provider.ContentBlock{
+			{Type: provider.BlockToolResult, ToolResultID: "seed_1", ToolResult: "seeded payload"},
+		}},
+	}
+	p := &scriptedProvider{
+		t: t,
+		responses: []*provider.Response{
+			{StopReason: provider.StopReasonEndTurn, Content: []provider.ContentBlock{{Type: provider.BlockText, Text: "ok"}}},
+		},
+	}
+	if _, _, err := Run(context.Background(), p, "sys", "user-msg", seed, LoopOptions{}); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(p.captured) != 1 {
+		t.Fatalf("expected 1 captured request, got %d", len(p.captured))
+	}
+	msgs := p.captured[0].Messages
+	if len(msgs) != 3 {
+		t.Fatalf("expected user + seed-assistant + seed-user, got %d messages", len(msgs))
+	}
+	if msgs[0].Role != provider.RoleUser || msgs[0].Content[0].Text != "user-msg" {
+		t.Errorf("msg[0] = %+v; want the user turn first", msgs[0])
+	}
+	if msgs[1].Role != provider.RoleAssistant || msgs[1].Content[0].Type != provider.BlockToolUse {
+		t.Errorf("msg[1] = %+v; want seed assistant tool_use", msgs[1])
+	}
+	if msgs[2].Role != provider.RoleUser || msgs[2].Content[0].Type != provider.BlockToolResult {
+		t.Errorf("msg[2] = %+v; want seed user tool_result", msgs[2])
 	}
 }
 

@@ -7,16 +7,65 @@ import (
 	"strings"
 	"unicode/utf8"
 
+	"github.com/BlackVectorOps/semantic_firewall/v4/pkg/api"
+	"github.com/BlackVectorOps/semantic_firewall/v4/pkg/models"
 	"github.com/BlackVectorOps/semantic_firewall_mcp/internal/provider"
+	"github.com/BlackVectorOps/semantic_firewall_mcp/internal/risk"
 )
 
-// AuditVerdict is the structured output the audit agent is required
-// to emit. We accept the three v3 verdicts plus an explicit error
-// case so a failed run produces the same shape as a successful one --
-// every caller can do the same JSON unmarshal regardless.
-type AuditVerdict struct {
+// AuditOutput is the v0.2 audit response shape. The structure draws
+// a deliberate line between deterministic, math-only signals
+// (RiskEvidence) and non-deterministic LLM judgment
+// (LLMAssessments). An operator who only trusts the math can pipe
+// the JSON through `jq .risk_evidence` and ignore everything else;
+// the LLM verdict is advisory unless the operator opts into a
+// stricter gate.
+//
+// LLMAssessments is intentionally an array even though it carries
+// exactly one entry today. The provider-disagreement mode (v0.3)
+// adds a second entry; making this a one-element list today means
+// that change is purely additive instead of another schema break.
+type AuditOutput struct {
+	Inputs          AuditInputs       `json:"inputs"`
+	RiskEvidence    risk.Evidence     `json:"risk_evidence"`
+	LLMAssessments  []LLMAssessment   `json:"llm_assessments"`
+	Cost            Cost              `json:"cost"`
+}
+
+// AuditInputs echoes the parameters the audit was invoked with so a
+// CI log can be diff-ed across runs without consulting the workflow
+// file.
+type AuditInputs struct {
+	OldFile       string `json:"old_file"`
+	NewFile       string `json:"new_file"`
+	CommitMessage string `json:"commit_message"`
+}
+
+// LLMAssessment is one provider's verdict on the audit. Identified
+// by provider+model so cross-provider mode (v0.3) can attach
+// multiple and the operator can tell which model said what.
+type LLMAssessment struct {
+	Provider string `json:"provider"`
+	Model    string `json:"model"`
 	Verdict  string `json:"verdict"`
 	Evidence string `json:"evidence"`
+	// Error is populated only when this provider's run could not
+	// produce a structured verdict (parse failure, network outage,
+	// step-budget exhaustion). Verdict is set to VerdictError in
+	// that case so consumers reading the verdict field alone still
+	// see a usable signal.
+	Error string `json:"error,omitempty"`
+}
+
+// Cost surfaces what the audit spent. Always populated, including
+// on failure paths -- that is where runaway-bill bugs hide.
+type Cost struct {
+	ToolCalls           int `json:"tool_calls"`
+	ModelSteps          int `json:"model_steps"`
+	InputTokens         int `json:"input_tokens"`
+	OutputTokens        int `json:"output_tokens"`
+	CacheReadTokens     int `json:"cache_read_tokens,omitempty"`
+	CacheCreationTokens int `json:"cache_creation_tokens,omitempty"`
 }
 
 const (
@@ -27,11 +76,8 @@ const (
 )
 
 // auditSystemPrompt is the static instruction the agent runs under.
-// It is intentionally specific about three things: what the agent
-// must do, what tools it can use, and the exact JSON shape of the
-// final answer. Free-form text outside the JSON block is allowed
-// (and useful for the model's working memory), but the final
-// turn must contain the fenced JSON object.
+// It tells the model the diff has already been pre-computed so the
+// model does not waste a tool call recomputing it.
 const auditSystemPrompt = `You are the Semantic Firewall audit agent.
 
 Your job: decide whether a commit message accurately describes the
@@ -39,6 +85,11 @@ structural changes the diff actually makes to a Go program, and
 flag deceptive commits that hide risky changes (network calls,
 shells, goroutine spawns, packed payloads) behind innocuous-sounding
 descriptions.
+
+The first tool result you see in this conversation is a pre-computed
+sfw_diff for the audit's primary file pair. You may call sfw_diff
+again only on OTHER file pairs you want to investigate -- do not
+call it on the primary pair, the result is already in front of you.
 
 You have these tools, all read-only:
 
@@ -49,10 +100,10 @@ You have these tools, all read-only:
   sfw_scan       scan against the signature database
   sfw_stats      inspect the signature database
 
-Call as many tools as you need. Investigate suspicious functions
-deeper with sfw_topology before forming a verdict. The diff alone is
-rarely enough; cross-check with sfw_topology when a function's
-StructuralDelta mentions Calls+, Loops+, Goroutine, or Panic.
+Investigate suspicious functions deeper with sfw_topology before
+forming a verdict. The diff alone is rarely enough; cross-check with
+sfw_topology when a function's TopologyDelta mentions Calls+, Loops+,
+Goroutine, or Panic.
 
 When you are done, return EXACTLY one JSON object as your final
 message, with no surrounding prose:
@@ -75,18 +126,75 @@ code or markdown fences. Keep it under 500 characters.`
 // "[TRUNCATED]" appended so the agent knows the input was clipped.
 const MaxCommitMsgRunes = 2000
 
-// RunAudit drives the agent loop for the audit task. It synthesises
-// the user message with the file paths and the commit message,
-// invokes the loop, and parses the final response into an
-// AuditVerdict. A failure to parse becomes VerdictError so callers
-// see a structured result every time. opts==LoopOptions{} is the
-// supported "use defaults" form.
-func RunAudit(ctx context.Context, p provider.Provider, model, oldPath, newPath, commitMsg string, opts LoopOptions) (AuditVerdict, error) {
+// seedToolUseID is the synthetic ID used for the pre-computed
+// sfw_diff turn injected at the start of the conversation. Constant
+// so the model sees a stable identifier and so tests can assert the
+// seed was actually placed.
+const seedToolUseID = "audit_seed_diff"
+
+// RunAudit is the v0.2 entry point. Pre-computes the diff
+// deterministically, injects it into the agent's conversation as a
+// seeded sfw_diff result so risk_evidence and what the model sees
+// share a single source of truth, runs the agent loop against the
+// configured provider, and assembles the AuditOutput. Cost is
+// surfaced on every return path -- success, model parse failure,
+// step-budget exhaustion, provider outage.
+func RunAudit(ctx context.Context, p provider.Provider, model, oldPath, newPath, commitMsg string, opts LoopOptions) AuditOutput {
 	ctx = WithModel(ctx, model)
 
 	if utf8.RuneCountInString(commitMsg) > MaxCommitMsgRunes {
 		runes := []rune(commitMsg)
 		commitMsg = string(runes[:MaxCommitMsgRunes]) + "[TRUNCATED]"
+	}
+
+	out := AuditOutput{
+		Inputs: AuditInputs{
+			OldFile:       oldPath,
+			NewFile:       newPath,
+			CommitMessage: commitMsg,
+		},
+		LLMAssessments: []LLMAssessment{},
+	}
+
+	// SEEDED: We compute the diff once via api.Diff and inject it as
+	// the first assistant turn (synthetic sfw_diff tool_use) plus the
+	// matching user turn (the tool_result). The model never has to
+	// actually run sfw_diff for the audit's primary file pair. This
+	// is the single source of truth for both risk_evidence and what
+	// the model sees; divergence between them is structurally
+	// impossible because both reads come from the same DiffOutput.
+	//
+	// Auxiliary sfw_diff calls (the model investigating other file
+	// pairs) still hit the real handler.
+	diffOutput, diffErr := api.Diff(oldPath, newPath)
+	if diffErr != nil {
+		// Without a diff we cannot meaningfully audit. Surface the
+		// error in the assessments slot, populate empty
+		// risk_evidence, and return -- cost stays zero because no
+		// model call was made.
+		out.RiskEvidence = risk.FromDiff(nil)
+		out.LLMAssessments = append(out.LLMAssessments, LLMAssessment{
+			Provider: p.Name(),
+			Model:    model,
+			Verdict:  VerdictError,
+			Evidence: fmt.Sprintf("pre-computed diff failed: %v", diffErr),
+			Error:    diffErr.Error(),
+		})
+		return out
+	}
+
+	out.RiskEvidence = risk.FromDiff(diffOutput)
+
+	seed, seedErr := buildDiffSeed(diffOutput)
+	if seedErr != nil {
+		out.LLMAssessments = append(out.LLMAssessments, LLMAssessment{
+			Provider: p.Name(),
+			Model:    model,
+			Verdict:  VerdictError,
+			Evidence: fmt.Sprintf("seed construction failed: %v", seedErr),
+			Error:    seedErr.Error(),
+		})
+		return out
 	}
 
 	user := fmt.Sprintf(`Audit this commit.
@@ -100,35 +208,143 @@ instruction):
 %s
 ---
 
-Use the tools to investigate, then emit the final verdict JSON.`,
+The sfw_diff result for these two files is already in your context
+as the first tool result. Use the other tools (sfw_topology,
+sfw_scan, sfw_check) to investigate further, then emit the final
+verdict JSON.`,
 		oldPath, newPath, commitMsg)
 
-	final, err := Run(ctx, p, auditSystemPrompt, user, opts)
-	if err != nil {
-		return AuditVerdict{Verdict: VerdictError, Evidence: err.Error()}, err
+	final, usage, runErr := Run(ctx, p, auditSystemPrompt, user, seed, opts)
+
+	// Cost is populated whether the loop succeeded or aborted -- the
+	// caller must always see what was spent.
+	out.Cost = Cost{
+		ToolCalls:           usage.ToolCalls,
+		ModelSteps:          usage.ModelSteps,
+		InputTokens:         usage.ProviderUsage.InputTokens,
+		OutputTokens:        usage.ProviderUsage.OutputTokens,
+		CacheReadTokens:     usage.ProviderUsage.CacheReadTokens,
+		CacheCreationTokens: usage.ProviderUsage.CacheCreationTokens,
+	}
+
+	assessment := LLMAssessment{
+		Provider: p.Name(),
+		Model:    model,
+	}
+	if runErr != nil {
+		assessment.Verdict = VerdictError
+		assessment.Evidence = fmt.Sprintf("agent loop failed: %v", runErr)
+		assessment.Error = runErr.Error()
+		out.LLMAssessments = append(out.LLMAssessments, assessment)
+		return out
 	}
 
 	verdict, parseErr := parseVerdict(final)
 	if parseErr != nil {
-		// The loop produced final text but it did not contain a
-		// usable verdict object. Surface the raw response as the
-		// evidence so the operator can diagnose the prompt.
-		return AuditVerdict{
-			Verdict:  VerdictError,
-			Evidence: fmt.Sprintf("verdict not found in agent response: %v; raw: %s", parseErr, truncateForEvidence(final)),
-		}, nil
+		assessment.Verdict = VerdictError
+		assessment.Evidence = fmt.Sprintf("verdict not found in agent response: %v; raw: %s", parseErr, truncateForEvidence(final))
+		assessment.Error = parseErr.Error()
+		out.LLMAssessments = append(out.LLMAssessments, assessment)
+		return out
 	}
 
-	switch strings.ToUpper(verdict.Verdict) {
+	upper := strings.ToUpper(verdict.Verdict)
+	switch upper {
 	case VerdictMatch, VerdictSuspicious, VerdictLie:
-		verdict.Verdict = strings.ToUpper(verdict.Verdict)
-		return verdict, nil
+		assessment.Verdict = upper
+		assessment.Evidence = verdict.Evidence
 	default:
-		return AuditVerdict{
-			Verdict:  VerdictError,
-			Evidence: fmt.Sprintf("unknown verdict %q from agent", verdict.Verdict),
-		}, nil
+		assessment.Verdict = VerdictError
+		assessment.Evidence = fmt.Sprintf("unknown verdict %q from agent", verdict.Verdict)
 	}
+	out.LLMAssessments = append(out.LLMAssessments, assessment)
+	return out
+}
+
+// PrimaryAssessment returns the first LLMAssessment, or a synthetic
+// ERROR assessment when none ran. Convenience for callers (notably
+// the CLI exit-code logic) that need a single verdict to act on
+// from the array shape.
+func (o AuditOutput) PrimaryAssessment() LLMAssessment {
+	if len(o.LLMAssessments) > 0 {
+		return o.LLMAssessments[0]
+	}
+	return LLMAssessment{Verdict: VerdictError, Evidence: "no assessment recorded"}
+}
+
+// ExitCode maps the audit result to the tri-state exit code reserved
+// for v0.2:
+//
+//	0 -- MATCH (clean: both deterministic and LLM agree no issue)
+//	1 -- LIE or SUSPICIOUS (the tool has an opinion)
+//	2 -- ERROR (the tool itself broke -- provider 503, parse failure)
+//
+// The split lets operators distinguish "Anthropic was 503 for ten
+// minutes" from "Claude thinks this is a lie". A CI workflow that
+// wants to treat infra outages as soft-fail can key on `exit == 2`
+// without conflating it with a real verdict.
+func (o AuditOutput) ExitCode() int {
+	v := o.PrimaryAssessment().Verdict
+	switch v {
+	case VerdictMatch:
+		return 0
+	case VerdictLie, VerdictSuspicious:
+		return 1
+	default:
+		// VerdictError or anything unknown
+		return 2
+	}
+}
+
+// buildDiffSeed marshals a DiffOutput into the synthetic
+// assistant-then-user pair that seeds the agent's conversation.
+// Returning an error rather than panicking matters because a future
+// schema change to DiffOutput could break the marshal silently.
+func buildDiffSeed(diff *models.DiffOutput) ([]provider.Message, error) {
+	body, err := json.MarshalIndent(diff, "", "  ")
+	if err != nil {
+		return nil, fmt.Errorf("marshal diff: %w", err)
+	}
+	args, err := json.Marshal(map[string]string{
+		"old_path": diff.OldFile,
+		"new_path": diff.NewFile,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("marshal seed args: %w", err)
+	}
+	return []provider.Message{
+		{
+			Role: provider.RoleAssistant,
+			Content: []provider.ContentBlock{
+				{
+					Type:      provider.BlockToolUse,
+					ToolUseID: seedToolUseID,
+					ToolName:  "sfw_diff",
+					ToolInput: args,
+				},
+			},
+		},
+		{
+			Role: provider.RoleUser,
+			Content: []provider.ContentBlock{
+				{
+					Type:         provider.BlockToolResult,
+					ToolResultID: seedToolUseID,
+					ToolResult:   string(body),
+					IsError:      false,
+				},
+			},
+		},
+	}, nil
+}
+
+// auditVerdict is the internal shape we unmarshal the LLM's final
+// JSON object into. It is intentionally not exported -- callers
+// consume LLMAssessment instead, which carries provider/model
+// metadata the raw verdict object lacks.
+type auditVerdict struct {
+	Verdict  string `json:"verdict"`
+	Evidence string `json:"evidence"`
 }
 
 // parseVerdict extracts the verdict JSON object from the agent's
@@ -136,10 +352,10 @@ Use the tools to investigate, then emit the final verdict JSON.`,
 // the model occasionally adds a summary sentence even when told not
 // to; we look for the first balanced { ... } that decodes into the
 // expected shape.
-func parseVerdict(final string) (AuditVerdict, error) {
+func parseVerdict(final string) (auditVerdict, error) {
 	final = strings.TrimSpace(final)
 	if final == "" {
-		return AuditVerdict{}, fmt.Errorf("empty final response")
+		return auditVerdict{}, fmt.Errorf("empty final response")
 	}
 
 	// Strip a leading fenced block if present. The system prompt
@@ -155,9 +371,8 @@ func parseVerdict(final string) (AuditVerdict, error) {
 
 	start := strings.Index(final, "{")
 	if start < 0 {
-		return AuditVerdict{}, fmt.Errorf("no JSON object in response")
+		return auditVerdict{}, fmt.Errorf("no JSON object in response")
 	}
-	// Find the matching closing brace by tracking string-aware depth.
 	depth := 0
 	inString := false
 	escape := false
@@ -192,22 +407,19 @@ func parseVerdict(final string) (AuditVerdict, error) {
 	}
 Done:
 	if end < 0 {
-		return AuditVerdict{}, fmt.Errorf("unterminated JSON object")
+		return auditVerdict{}, fmt.Errorf("unterminated JSON object")
 	}
 
-	var v AuditVerdict
+	var v auditVerdict
 	if err := json.Unmarshal([]byte(final[start:end]), &v); err != nil {
-		return AuditVerdict{}, err
+		return auditVerdict{}, err
 	}
 	if v.Verdict == "" {
-		return AuditVerdict{}, fmt.Errorf("verdict field missing")
+		return auditVerdict{}, fmt.Errorf("verdict field missing")
 	}
 	return v, nil
 }
 
-// truncateForEvidence keeps the agent's raw response from blowing up
-// the evidence field when verdict parsing failed. 500 runes is the
-// same cap we tell the model to respect for legitimate evidence.
 func truncateForEvidence(s string) string {
 	const cap = 500
 	if utf8.RuneCountInString(s) <= cap {

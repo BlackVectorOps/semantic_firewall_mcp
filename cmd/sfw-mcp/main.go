@@ -114,24 +114,21 @@ func runAudit(args []string) error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	verdict, err := agent.RunAudit(ctx, p, *model, oldPath, newPath, commitMsg, agent.LoopOptions{
+	out := agent.RunAudit(ctx, p, *model, oldPath, newPath, commitMsg, agent.LoopOptions{
 		MaxSteps:  *maxSteps,
 		MaxTokens: *maxTokens,
 	})
-	if err != nil {
-		// agent.RunAudit already populated verdict with an ERROR
-		// payload; emit it so the caller still gets the structured
-		// JSON, then surface the underlying error via exit code.
-		writeVerdict(verdict)
-		return err
-	}
-	writeVerdict(verdict)
+	writeAuditOutput(out)
 
-	// Exit code mirrors v3's `sfw audit`: 0 only when the verdict
-	// is MATCH; SUSPICIOUS, LIE, and ERROR all exit 1 so an
-	// existing CI gate keeps tripping the same way.
-	if verdict.Verdict != agent.VerdictMatch {
-		os.Exit(1)
+	// Tri-state exit code -- see agent.AuditOutput.ExitCode for the
+	// contract.
+	//
+	//   0  -- MATCH        (clean)
+	//   1  -- LIE / SUSPICIOUS  (the tool has an opinion)
+	//   2  -- ERROR        (the tool itself broke -- provider 503,
+	//                       parse failure, step-budget exhaustion)
+	if code := out.ExitCode(); code != 0 {
+		os.Exit(code)
 	}
 	return nil
 }
@@ -189,13 +186,13 @@ func buildProvider(name, apiKey, apiBase string) (provider.Provider, error) {
 	}
 }
 
-// writeVerdict prints the audit JSON to stdout. We do it from the
-// command rather than from inside agent.RunAudit so the agent stays
-// stdout-agnostic and can be reused from a future programmatic
+// writeAuditOutput prints the audit JSON to stdout. We do it from
+// the command rather than from inside agent.RunAudit so the agent
+// stays stdout-agnostic and can be reused from a future programmatic
 // caller without forcing them to capture stdout.
-func writeVerdict(v agent.AuditVerdict) {
+func writeAuditOutput(o agent.AuditOutput) {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
-	_ = enc.Encode(v)
+	_ = enc.Encode(o)
 }
 

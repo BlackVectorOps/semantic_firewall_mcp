@@ -39,17 +39,53 @@ type LoopOptions struct {
 	MaxTokens int
 }
 
+// AgentUsage records the resource cost of a Run call. It is
+// populated on every return path -- success, max_tokens abort, step-
+// budget exhaustion, mid-loop provider error -- so the caller never
+// loses sight of what was already spent before a failure. That is
+// the "runaway-bill hides in the failure path" hole the v0.2
+// release explicitly closes.
+type AgentUsage struct {
+	ToolCalls     int
+	ModelSteps    int
+	ProviderUsage provider.Usage
+}
+
+// add folds a Response's token usage and tool_use block count into
+// the running total. Called once per provider round-trip.
+func (u *AgentUsage) add(resp *provider.Response) {
+	if resp == nil {
+		return
+	}
+	u.ModelSteps++
+	u.ProviderUsage.InputTokens += resp.Usage.InputTokens
+	u.ProviderUsage.OutputTokens += resp.Usage.OutputTokens
+	u.ProviderUsage.CacheReadTokens += resp.Usage.CacheReadTokens
+	u.ProviderUsage.CacheCreationTokens += resp.Usage.CacheCreationTokens
+	for _, b := range resp.Content {
+		if b.Type == provider.BlockToolUse {
+			u.ToolCalls++
+		}
+	}
+}
+
 // Run executes the tool-use loop until the model emits end_turn,
 // the step budget is exhausted, or a tool call returns a fatal
-// error. The accumulated assistant text from the final turn is
-// returned; intermediate text is intentionally discarded -- only the
-// model's final answer is part of the agent's contract with its
-// caller.
+// error. Returns the accumulated assistant text from the final
+// turn (empty on any non-end_turn exit) and the running AgentUsage
+// regardless of which path produced the result. The third return
+// is the error, if any.
+//
+// seed lets the caller pre-populate the conversation with prior
+// turns. The audit harness uses this to inject a pre-computed
+// sfw_diff result as turn 1, so the model never has to call the
+// tool itself for the audit's primary file pair and risk_evidence
+// + the model's view share one source of truth.
 //
 // Tools come from tools.All() so the agent automatically inherits
 // every tool the MCP server publishes. A separate "agent-only" tool
 // list would invite drift; we explicitly want one source of truth.
-func Run(ctx context.Context, p provider.Provider, system, user string, opts LoopOptions) (string, error) {
+func Run(ctx context.Context, p provider.Provider, system, user string, seed []provider.Message, opts LoopOptions) (string, AgentUsage, error) {
 	if opts.MaxSteps <= 0 {
 		opts.MaxSteps = DefaultMaxSteps
 	}
@@ -57,10 +93,12 @@ func Run(ctx context.Context, p provider.Provider, system, user string, opts Loo
 		opts.MaxTokens = DefaultMaxTokens
 	}
 
+	var usage AgentUsage
+
 	registry := tools.All()
 	specs, dispatch, err := buildToolDispatch(registry)
 	if err != nil {
-		return "", err
+		return "", usage, err
 	}
 
 	messages := []provider.Message{
@@ -69,6 +107,12 @@ func Run(ctx context.Context, p provider.Provider, system, user string, opts Loo
 			Content: []provider.ContentBlock{{Type: provider.BlockText, Text: user}},
 		},
 	}
+	// Append the seed turns after the user's audit request. The seed
+	// is structured as alternating assistant tool_use / user
+	// tool_result pairs; appending after the initial user turn keeps
+	// the conversation valid for every provider's role-alternation
+	// requirements.
+	messages = append(messages, seed...)
 
 	var finalText strings.Builder
 
@@ -81,8 +125,9 @@ func Run(ctx context.Context, p provider.Provider, system, user string, opts Loo
 			MaxTokens: opts.MaxTokens,
 		})
 		if err != nil {
-			return "", fmt.Errorf("provider %s step %d: %w", p.Name(), step, err)
+			return "", usage, fmt.Errorf("provider %s step %d: %w", p.Name(), step, err)
 		}
+		usage.add(resp)
 
 		// Replay the assistant turn verbatim into the conversation so
 		// the next request sees its own prior tool_use blocks. Every
@@ -100,16 +145,16 @@ func Run(ctx context.Context, p provider.Provider, system, user string, opts Loo
 					finalText.WriteString(b.Text)
 				}
 			}
-			return finalText.String(), nil
+			return finalText.String(), usage, nil
 
 		case provider.StopReasonMaxTokens:
-			return "", fmt.Errorf("provider %s step %d: max_tokens reached before end_turn", p.Name(), step)
+			return "", usage, fmt.Errorf("provider %s step %d: max_tokens reached before end_turn", p.Name(), step)
 
 		case provider.StopReasonToolUse:
 			// fall through to tool dispatch
 
 		default:
-			return "", fmt.Errorf("provider %s step %d: unexpected stop reason %q", p.Name(), step, resp.StopReason)
+			return "", usage, fmt.Errorf("provider %s step %d: unexpected stop reason %q", p.Name(), step, resp.StopReason)
 		}
 
 		// Execute every tool_use block the model emitted in this
@@ -117,12 +162,12 @@ func Run(ctx context.Context, p provider.Provider, system, user string, opts Loo
 		// every matching tool_result.
 		results, err := dispatchToolUses(ctx, dispatch, resp.Content)
 		if err != nil {
-			return "", err
+			return "", usage, err
 		}
 		if len(results) == 0 {
 			// tool_use stop reason with no tool_use blocks should not
 			// happen but if it does, abort instead of spinning.
-			return "", fmt.Errorf("provider %s step %d: tool_use stop reason but no tool blocks emitted", p.Name(), step)
+			return "", usage, fmt.Errorf("provider %s step %d: tool_use stop reason but no tool blocks emitted", p.Name(), step)
 		}
 		messages = append(messages, provider.Message{
 			Role:    provider.RoleUser,
@@ -130,7 +175,7 @@ func Run(ctx context.Context, p provider.Provider, system, user string, opts Loo
 		})
 	}
 
-	return "", fmt.Errorf("provider %s: step budget %d exhausted before end_turn", p.Name(), opts.MaxSteps)
+	return "", usage, fmt.Errorf("provider %s: step budget %d exhausted before end_turn", p.Name(), opts.MaxSteps)
 }
 
 // buildToolDispatch returns the provider-facing ToolSpec list and a
