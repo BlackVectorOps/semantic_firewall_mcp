@@ -18,15 +18,28 @@ func TestBuild_NeverEmpty(t *testing.T) {
 }
 
 // TestEngine_NeverEmpty mirrors Build's invariant for the linked sfw
-// engine version. semantic_firewall/pkg/version.EngineVersion always
-// returns a non-empty string in the same shape ("<version> (<flags>)").
+// engine version. Engine() walks build info for the sfw dependency;
+// when the test binary itself has no usable build info (the typical
+// `go test` case) it must still return the fallback string rather
+// than empty, so callers can print without a nil check.
 func TestEngine_NeverEmpty(t *testing.T) {
-	got := Engine()
-	if got == "" {
-		t.Fatal("Engine() returned empty string")
+	if got := Engine(); got == "" {
+		t.Errorf("Engine() = %q; want non-empty (fallback or dep version)", got)
 	}
-	if !strings.Contains(got, "(") || !strings.Contains(got, ")") {
-		t.Errorf("Engine() = %q; expected feature-flag suffix in parentheses", got)
+}
+
+// TestEngine_NotMainModule pins the regression behind v0.1.2: when
+// debug.ReadBuildInfo's Main.Version differs from the sfw dep's
+// version, Engine() must report the dep version, not Main. We can't
+// stage a synthetic BuildInfo from a test (the runtime owns it), so
+// the test only enforces that Engine() does NOT echo Build(); they
+// might both be the (devel) fallback under `go test`, but if either
+// reports a real version they must differ.
+func TestEngine_NotMainModule(t *testing.T) {
+	build := Build()
+	engine := Engine()
+	if build != fallback && engine != fallback && build == engine {
+		t.Errorf("Engine() = Build() = %q; Engine must report the linked sfw dep, not the binary itself", engine)
 	}
 }
 
